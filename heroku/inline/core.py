@@ -474,13 +474,17 @@ class InlineManager(
             return
 
         del self._bot_update_handlers[handler_id]
-        self._bot_handler_refs.pop(handler_id, None)
+        removed_ref = self._bot_handler_refs.pop(handler_id, None)
         logger.debug("Unregistered bot update handler %s", handler_id)
 
         if not self._bot_client:
             return
 
-        for handler, event_builder in list(self._bot_handler_refs.values()):
+        refs = list(self._bot_handler_refs.values())
+        if removed_ref:
+            refs.append(removed_ref)
+
+        for handler, event_builder in refs:
             self._bot_client.remove_event_handler(handler, event_builder)
         self._bot_handler_refs.clear()
 
