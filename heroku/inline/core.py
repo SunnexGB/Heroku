@@ -43,6 +43,7 @@ from herokutl.tl.types import (
     SendMessageTypingAction,
     UpdateBotChatBoost,
     UpdateBotChatInviteRequester,
+    UpdateBotGuestChatQuery,
     UpdateBotInlineSend,
     UpdateBotMessageReaction,
     UpdateBotMessageReactions,
@@ -93,6 +94,7 @@ BotUpdateType = typing.Literal[
     "message_reaction_count",
     "chat_boost",
     "removed_chat_boost",
+    "guest_message",
 ]
 
 _BOT_UPDATE_EVENTS: dict[BotUpdateType, typing.Callable[[], object]] = {
@@ -120,6 +122,7 @@ _BOT_UPDATE_EVENTS: dict[BotUpdateType, typing.Callable[[], object]] = {
     "message_reaction_count": lambda: events.Raw(types=UpdateBotMessageReactions),
     "chat_boost": lambda: events.Raw(types=UpdateBotChatBoost),
     "removed_chat_boost": lambda: events.Raw(types=UpdateBotChatBoost),
+    "guest_message": lambda: events.Raw(types=UpdateBotGuestChatQuery),
 }
 
 
