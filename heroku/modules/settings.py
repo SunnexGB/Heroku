@@ -333,7 +333,7 @@ class CoreMod(loader.Module):
             if not line:
                 continue
 
-            if "," in line:
+            if "&&" in line:
                 parts = [part.strip() for part in line.split(",")]
                 last = parts[-1].split(maxsplit=1)
                 if len(last) < 2:
