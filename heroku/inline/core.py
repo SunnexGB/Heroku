@@ -13,9 +13,9 @@
 # 🔑 https://www.gnu.org/licenses/agpl-3.0.html
 
 import asyncio
-import contextlib
 import logging
 import os
+import sqlite3
 import time
 import typing
 
@@ -43,6 +43,7 @@ from herokutl.tl.types import (
     SendMessageTypingAction,
     UpdateBotChatBoost,
     UpdateBotChatInviteRequester,
+    UpdateBotGuestChatQuery,
     UpdateBotInlineSend,
     UpdateBotMessageReaction,
     UpdateBotMessageReactions,
@@ -93,6 +94,7 @@ BotUpdateType = typing.Literal[
     "message_reaction_count",
     "chat_boost",
     "removed_chat_boost",
+    "guest_message",
 ]
 
 _BOT_UPDATE_EVENTS: dict[BotUpdateType, typing.Callable[[], object]] = {
@@ -120,6 +122,7 @@ _BOT_UPDATE_EVENTS: dict[BotUpdateType, typing.Callable[[], object]] = {
     "message_reaction_count": lambda: events.Raw(types=UpdateBotMessageReactions),
     "chat_boost": lambda: events.Raw(types=UpdateBotChatBoost),
     "removed_chat_boost": lambda: events.Raw(types=UpdateBotChatBoost),
+    "guest_message": lambda: events.Raw(types=UpdateBotGuestChatQuery),
 }
 
 
@@ -182,7 +185,7 @@ class InlineManager(
         while True:
             for unit_id, unit in self._units.copy().items():
                 if (unit.get("ttl") or (time.time() + self._markup_ttl)) < time.time():
-                    del self._units[unit_id]
+                    await self._unload_unit(unit_id)
 
             await asyncio.sleep(5)
 
@@ -239,13 +242,17 @@ class InlineManager(
         self,
         after_break: bool = False,
         ignore_token_checks: bool = False,
+        force_new_bot: bool = False,
     ):
         """
         Register manager
         :param after_break: Loop marker
         :param ignore_token_checks: If `True`, will not check for token
+        :param force_new_bot: If `True`, will not search for an existing bot
+            in BotFather and will create a brand new one instead
         :type after_break: bool
         :type ignore_token_checks: bool
+        :type force_new_bot: bool
         :return: None
         :rtype: None
         """
@@ -253,12 +260,18 @@ class InlineManager(
         self._name = get_display_name(self._client.heroku_me)
 
         if not ignore_token_checks:
-            is_token_asserted = await self._assert_token()
+            is_token_asserted = await self._assert_token(skip_search=force_new_bot)
             if not is_token_asserted:
                 self.init_complete = False
                 return
 
         self.init_complete = True
+
+        if self._bot_client:
+            try:
+                await self._bot_client.disconnect()
+            except Exception:
+                pass
 
         bot_uid = self._token.split(":", 1)[0]
         self._cleanup_stale_bot_sessions(bot_uid)
@@ -299,6 +312,21 @@ class InlineManager(
             )
             self.init_complete = False
             return False
+        except sqlite3.OperationalError:
+            logger.critical(
+                "Bot session database is locked, could not start bot client",
+                exc_info=True,
+            )
+            self.init_complete = False
+            return False
+
+        if self._db.get("heroku.inline", "needs_inline_setup", False):
+            try:
+                await self._configure_inline_bot(self.bot_username)
+            except Exception:
+                pass
+
+            self._db.set("heroku.inline", "needs_inline_setup", False)
 
         result = await self._ping_bot(after_break)
         if result is not True:
@@ -360,7 +388,7 @@ class InlineManager(
             self._token = False
 
             if not after_break:
-                return await self.register_manager(True)
+                return await self.register_manager(True, force_new_bot=True)
 
             self.init_complete = False
             return False
@@ -446,13 +474,17 @@ class InlineManager(
             return
 
         del self._bot_update_handlers[handler_id]
-        self._bot_handler_refs.pop(handler_id, None)
+        removed_ref = self._bot_handler_refs.pop(handler_id, None)
         logger.debug("Unregistered bot update handler %s", handler_id)
 
         if not self._bot_client:
             return
 
-        for handler, event_builder in list(self._bot_handler_refs.values()):
+        refs = list(self._bot_handler_refs.values())
+        if removed_ref:
+            refs.append(removed_ref)
+
+        for handler, event_builder in refs:
             self._bot_client.remove_event_handler(handler, event_builder)
         self._bot_handler_refs.clear()
 
@@ -465,7 +497,12 @@ class InlineManager(
             self._bot_handler_refs[hid] = (handler, event_builder)
         logger.debug("Rebuilt custom handlers after unregistering %s", handler_id)
 
-    async def _invoke_unit(self, unit_id: str, message: Message) -> Message:
+    async def _invoke_unit(
+        self,
+        unit_id: str,
+        message: Message,
+        reply_to: Message | int | None = None,
+    ) -> Message:
         event = asyncio.Event()
         self._error_events[unit_id] = event
 
@@ -474,12 +511,18 @@ class InlineManager(
 
         async def result_getter():
             nonlocal unit_id, q
-            with contextlib.suppress(Exception):
+            try:
                 q = await self._client.inline_query(self.bot_username, unit_id)
+            except Exception:
+                logger.exception("Inline query for unit %s failed", unit_id)
 
         async def event_poller():
             nonlocal exception
-            await asyncio.wait_for(event.wait(), timeout=10)
+            try:
+                await asyncio.wait_for(event.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                logger.debug("Inline query for unit %s timed out after 10s", unit_id)
+                return
             if self._error_events.get(unit_id):
                 exception = self._error_events[unit_id]
 
@@ -505,6 +548,10 @@ class InlineManager(
         return await q[0].click(
             utils.get_chat_id(message) if isinstance(message, Message) else message,
             reply_to=(
-                message.reply_to_msg_id if isinstance(message, Message) else None
+                reply_to
+                if reply_to is not None
+                else (
+                    message.reply_to_msg_id if isinstance(message, Message) else None
+                )
             ),
         )

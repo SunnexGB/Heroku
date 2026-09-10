@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import difflib
 import functools
+import hashlib
 import importlib
 import inspect
 import io
@@ -68,14 +69,14 @@ class ModuleInstallError(RuntimeError):
 class LoaderMod(loader.Module):
     """Loads modules"""
 
-    strings = {
-        "name": "Loader",
-    }
+    strings = {"name": "Loader"}
 
     def __init__(self):
         self.fully_loaded = False
         self._links_cache = {}
         self._storage: RemoteStorage = None
+        self._modules_cache_dir = os.path.join(main.BASE_DIR, ".modules_cache")
+        self._pending_module_updates = {}
 
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
@@ -207,8 +208,12 @@ class LoaderMod(loader.Module):
         return repo
 
     async def _check_pass(self, message: Message | InlineCall) -> bool:
-        if self.lookup("LoaderRestrictor").get("passed", False):
+        if self.db.get("LoaderRestrictor", "passed", False):
             return False
+
+        if not self.inline.init_complete:
+            return False # in case the inline bot did not start successfully,
+                         # allow the user to install the modules
 
         await utils.answer(
             message,
@@ -416,12 +421,14 @@ class LoaderMod(loader.Module):
         module_name: str,
         message: Message | None = None,
         force_pm: bool = False,
+        name: str | None = None,
     ) -> int:
         try:
             blob_link = False
             module_name = module_name.strip()
             if urlparse(module_name).netloc:
                 url = module_name
+                resolved_name = name
                 if re.match(
                     r"^(https:\/\/github\.com\/.*?\/.*?\/blob\/.*\.py)|"
                     r"(https:\/\/gitlab\.com\/.*?\/.*?\/-\/blob\/.*\.py)$",
@@ -431,6 +438,7 @@ class LoaderMod(loader.Module):
                     blob_link = True
             else:
                 url = await self._find_link(module_name)
+                resolved_name = name or module_name
 
                 if not url:
                     logger.warning(
@@ -464,7 +472,7 @@ class LoaderMod(loader.Module):
             installed = await self.load_module(
                 r,
                 message,
-                module_name,
+                resolved_name,
                 url,
                 blob_link=blob_link,
                 _raise_install_errors=True,
@@ -473,6 +481,7 @@ class LoaderMod(loader.Module):
             if not installed:
                 raise ModuleInstallError(f"Module {module_name} was not installed")
 
+            self._write_module_cache(url, r)
             return MODULE_LOADING_SUCCESS
         except Exception:
             logger.exception("Failed to install external module %s", module_name)
@@ -1257,8 +1266,8 @@ class LoaderMod(loader.Module):
         if (
             self.config["show_banner"]
             and not subscribe_markup
-            and not message.document
-            or message.web_preview
+            and not getattr(message, "document", None)
+            or getattr(message, "web_preview", False)
         ):
             try:
                 banner_url = self._get_banner_url(doc)
@@ -1323,7 +1332,10 @@ class LoaderMod(loader.Module):
                 **banner_kwargs,
             )
         except MediaCaptionTooLongError:
-            await message.reply(loaded_msg(False))
+            if hasattr(message, "reply"):
+                await message.reply(loaded_msg(False))
+            else:
+                await message.edit(loaded_msg(False))
 
         return True
 
@@ -1620,6 +1632,9 @@ class LoaderMod(loader.Module):
 
     async def _inline__clearmodules(self, call: InlineCall):
         self.set("loaded_modules", {})
+        self.set("always_update_modules", [])
+        self._pending_module_updates.clear()
+        shutil.rmtree(self._modules_cache_dir, ignore_errors=True)
 
         for file in os.scandir(loader.LOADED_MODULES_DIR):
             try:
@@ -1630,6 +1645,296 @@ class LoaderMod(loader.Module):
         await utils.answer(call, self.strings["all_modules_deleted"])
         await self.lookup("Updater").restart_common(call)
 
+    def _module_cache_path(self, url: str) -> str:
+        key = hashlib.sha256(url.encode()).hexdigest()
+        return os.path.join(self._modules_cache_dir, f"{key}.py")
+
+    @staticmethod
+    def _module_class_names(doc: str) -> set[str]:
+        try:
+            tree = ast.parse(doc)
+        except (SyntaxError, ValueError):
+            return set()
+
+        return {
+            node.name.casefold()
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and any(
+                isinstance(base, ast.Name)
+                and base.id == "Module"
+                or isinstance(base, ast.Attribute)
+                and base.attr == "Module"
+                for base in node.bases
+            )
+        }
+
+    @staticmethod
+    def _extract_module_name(doc: str) -> str | None:
+        try:
+            tree = ast.parse(doc)
+        except (SyntaxError, ValueError):
+            return None
+
+        return next(
+            (
+                node.name
+                for node in tree.body
+                if isinstance(node, ast.ClassDef)
+                and any(
+                    isinstance(base, ast.Name)
+                    and base.id == "Module"
+                    or isinstance(base, ast.Attribute)
+                    and base.attr == "Module"
+                    for base in node.bases
+                )
+            ),
+            None,
+        )
+
+    def _is_core_module_update(self, url: str, doc: str) -> bool:
+        path = [part.casefold() for part in urlparse(url).path.strip("/").split("/")]
+        if any(
+            path[index : index + 2] == ["heroku", "modules"]
+            for index in range(len(path) - 1)
+        ):
+            return True
+
+        classes = self._module_class_names(doc)
+        return any(
+            module.__class__.__name__.casefold() in classes
+            and getattr(module, "__origin__", "").startswith("<core")
+            for module in self.allmodules.modules
+        )
+
+    def _write_module_cache(self, url: str, doc: str) -> None:
+        os.makedirs(self._modules_cache_dir, exist_ok=True)
+        path = self._module_cache_path(url)
+        tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8", newline="") as file:
+                file.write(doc)
+            os.replace(tmp_path, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(tmp_path)
+
+    async def _accept_module_update(
+        self,
+        call: InlineCall,
+        token: str,
+        always: bool = False,
+    ):
+        pending = self._pending_module_updates.pop(token, None)
+        if pending is None:
+            await call.edit(self.strings["module_update_expired"])
+            return
+
+        url, doc = pending
+        if always:
+            urls = set(self.get("always_update_modules", []))
+            urls.add(url)
+            self.set("always_update_modules", sorted(urls))
+
+        installed = await self.load_module(
+            doc,
+            call,
+            self._extract_module_name(doc),
+            url,
+            _raise_install_errors=True,
+        )
+        if not installed:
+            await call.edit(self.strings["module_update_failed"])
+            return
+
+        self._write_module_cache(url, doc)
+        self.update_modules_in_db()
+        await call.edit(self.strings["module_update_installed"])
+
+    async def _decline_module_update(self, call: InlineCall, token: str):
+        self._pending_module_updates.pop(token, None)
+        await call.edit(self.strings["module_update_declined"])
+
+    async def _offer_module_update(self, url: str, doc: str) -> None:
+        name = self._extract_module_name(doc) or url.rsplit("/", 1)[-1].removesuffix(
+            ".py"
+        )
+        name = f'<a href="{utils.escape_html(url)}">{utils.escape_html(name)}</a>'
+        token = uuid.uuid4().hex
+        self._pending_module_updates[token] = (url, doc)
+
+        for _ in range(120):
+            if self.inline.init_complete and self.inline._bot_client:
+                break
+            await asyncio.sleep(1)
+        else:
+            self._pending_module_updates.pop(token, None)
+            logger.error("Inline bot is not ready; module update prompt was not sent")
+            return
+
+        unit_id = utils.rand(16)
+        buttons = [
+            [
+                {
+                    "text": self.strings["module_update_yes"],
+                    "callback": self._accept_module_update,
+                    "args": (token, False),
+                    "emoji_id": "5899757765743615694",
+                    "style": "success",
+                },
+                {
+                    "text": self.strings["module_update_no"],
+                    "callback": self._decline_module_update,
+                    "args": (token,),
+                    "emoji_id": "5872829476143894491",
+                    "style": "danger",
+                },
+            ],
+            [
+                {
+                    "text": self.strings["module_update_always"],
+                    "callback": self._accept_module_update,
+                    "args": (token, True),
+                    "emoji_id": "5879883461711367869",
+                    "style": "primary",
+                }
+            ],
+        ]
+        self.inline._units[unit_id] = {
+            "type": "form",
+            "text": self.strings["module_update_prompt"].format(name),
+            "buttons": buttons,
+            "caller": None,
+            "chat": int(self.tg_id),
+            "message_id": None,
+            "uid": unit_id,
+            "force_me": True,
+        }
+
+        try:
+            markup = self.inline.generate_markup(unit_id)
+            sent = await self.inline.bot.send_message(
+                int(self.tg_id),
+                self.inline._units[unit_id]["text"],
+                reply_markup=markup,
+                disable_notification=True,
+            )
+            self.inline._units[unit_id]["message_id"] = sent.id
+        except Exception:
+            self._pending_module_updates.pop(token, None)
+            self.inline._units.pop(unit_id, None)
+            logger.exception(
+                "Failed to send module update prompt from inline bot to owner %s",
+                self.tg_id,
+            )
+            return
+
+    async def _check_module_update(
+        self,
+        url: str,
+        cached_doc: str | None = None,
+        *,
+        name: str | None = None,
+        offer_update: bool = True,
+    ) -> bool:
+        if cached_doc is None:
+            path = self._module_cache_path(url)
+            if not os.path.isfile(path):
+                return False
+
+            try:
+                with open(path, encoding="utf-8", newline="") as file:
+                    cached_doc = file.read()
+            except Exception:
+                logger.exception("Failed to read cached module %s", url)
+                return False
+
+        try:
+            remote_doc = await self._storage.fetch(url, auth=self.config["basic_auth"])
+        except Exception:
+            logger.warning("Failed to check module update for %s", url, exc_info=True)
+            return False
+
+        cached_hash = hashlib.sha256(cached_doc.encode()).digest()
+        remote_hash = hashlib.sha256(remote_doc.encode()).digest()
+        if cached_hash == remote_hash:
+            return False
+
+        if self._is_core_module_update(url, remote_doc):
+            self._write_module_cache(url, remote_doc)
+            return True
+
+        if url in self.get("always_update_modules", []):
+            installed = await self.load_module(
+                remote_doc,
+                None,
+                name,
+                url,
+                _raise_install_errors=True,
+            )
+            if installed:
+                self._write_module_cache(url, remote_doc)
+                self.update_modules_in_db()
+
+            return bool(installed)
+
+        if offer_update and not any(
+            pending_url == url
+            for pending_url, _ in self._pending_module_updates.values()
+        ):
+            await self._offer_module_update(url, remote_doc)
+
+        return False
+
+    async def _load_cached_module(self, url: str, name: str | None = None) -> None:
+        path = self._module_cache_path(url)
+        if not os.path.isfile(path):
+            try:
+                doc = await self._storage.fetch(url, auth=self.config["basic_auth"])
+            except Exception:
+                await self.download_and_install(url, name=name)
+                return
+
+            if self._is_core_module_update(url, doc):
+                self._write_module_cache(url, doc)
+                return
+
+            await self.download_and_install(url, name=name)
+            return
+
+        try:
+            with open(path, encoding="utf-8", newline="") as file:
+                cached_doc = file.read()
+            if self._is_core_module_update(url, cached_doc):
+                await self._check_module_update(url, cached_doc, name=name)
+                return
+
+            installed = await self.load_module(
+                cached_doc,
+                None,
+                name,
+                url,
+                _raise_install_errors=True,
+            )
+            if not installed:
+                raise ModuleInstallError(f"Cached module {url} was not installed")
+        except Exception:
+            logger.exception("Failed to load cached module %s", url)
+            return
+
+        await self._check_module_update(url, cached_doc, name=name)
+
+    @loader.loop(interval=60, wait_before=True, autostart=True)
+    async def _auto_update_modules(self):
+        if not self.fully_loaded or self._storage is None:
+            return
+
+        loaded_modules = self.get("loaded_modules", {})
+        always_update_urls = set(self.get("always_update_modules", []))
+        for name, url in loaded_modules.items():
+            if url in always_update_urls:
+                await self._check_module_update(url, offer_update=False, name=name)
+
     async def _update_modules(self):
         todo = await self._get_modules_to_load()
 
@@ -1639,8 +1944,8 @@ class LoaderMod(loader.Module):
             self._db.set(loader.__name__, "secure_boot", False)
             self._secure_boot = True
         else:
-            for mod in todo.values():
-                await self.download_and_install(mod)
+            for name, url in todo.items():
+                await self._load_cached_module(url, name)
 
             self.update_modules_in_db()
 

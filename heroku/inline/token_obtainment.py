@@ -164,9 +164,14 @@ class TokenObtainment(InlineUnit):
         self: "InlineManager",
         create_new_if_needed: bool = True,
         revoke_token: bool = False,
+        skip_search: bool = False,
     ) -> bool:
         if self._token:
             return True
+
+        if skip_search:
+            logger.info("Skipping search for an existing bot, creating a new one")
+            return await self._create_bot() if create_new_if_needed else False
 
         logger.info("Bot token not found in db, attempting search in BotFather")
 
@@ -313,6 +318,29 @@ class TokenObtainment(InlineUnit):
                     return True
 
         return await self._create_bot() if create_new_if_needed else False
+
+    async def _configure_inline_bot(self: "InlineManager", username: str):
+        username = f"@{username.strip('@')}"
+        async with self._client.conversation("@BotFather", exclusive=False) as conv:
+            for msg in [
+                "/setinline",
+                username,
+                "user@heroku:~$",
+                "/setinlinefeedback",
+                username,
+                "Enabled",
+            ]:
+                await fw_protect()
+                m = await conv.send_message(msg)
+                r = await conv.get_response()
+
+                logger.debug(">> %s", m.raw_text)
+                logger.debug("<< %s", r.raw_text)
+
+                await fw_protect()
+
+                await m.delete()
+                await r.delete()
 
     async def _reassert_token(self: "InlineManager"):
         is_token_asserted = await self._assert_token(revoke_token=True)

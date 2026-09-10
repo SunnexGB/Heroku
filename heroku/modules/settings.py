@@ -11,6 +11,7 @@
 # 🔑 https://www.gnu.org/licenses/agpl-3.0.html
 
 import contextlib
+import getpass
 import herokutl
 from herokutl.tl.types import Message, User
 
@@ -36,6 +37,12 @@ class CoreMod(loader.Module):
                 "alias_emoji",
                 "<tg-emoji emoji-id=4974259868996207180>▪️</tg-emoji>",
                 "just emoji in .aliases",
+            ),
+            loader.ConfigValue(
+                "rich_mode",
+                False,
+                lambda: self.strings["_cfg_rich_mode"],
+                validator=loader.validators.Boolean(),
             ),
         )
 
@@ -101,6 +108,23 @@ class CoreMod(loader.Module):
             branch_text = self.strings["happy_beta"].format(version.branch)
         else:
             branch_text = self.strings["unstable"].format(version.branch)
+
+        if self.config["rich_mode"]:
+            rich_message = self.strings["rich_heroku_message"].format(
+                platform=utils.get_platform_emoji(),
+                version=".".join(map(str, version.__version__)),
+                build=utils.get_commit_url(),
+                htl_version=herokutl.__version__,
+                layer=herokutl.tl.alltlobjects.LAYER,
+                current_user=getpass.getuser(),
+                banner_url="https://raw.githubusercontent.com/coddrago/assets/refs/heads/main/heroku/heroku_cmd.png",
+            )
+            await utils.answer(
+                message,
+                rich_message=rich_message,
+                reply_to=getattr(message, "reply_to_msg_id", None),
+            )
+            return
 
         await utils.answer(
             message,
@@ -309,7 +333,7 @@ class CoreMod(loader.Module):
             if not line:
                 continue
 
-            if "," in line:
+            if "&&" in line:
                 parts = [part.strip() for part in line.split(",")]
                 last = parts[-1].split(maxsplit=1)
                 if len(last) < 2:
