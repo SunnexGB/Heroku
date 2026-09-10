@@ -77,7 +77,7 @@ class HerokuWebMod(loader.Module):
             await utils.answer(message, self.strings["invalid_target"])
             return
 
-        if not user.id not in await allowed_ids():
+        if user.id not in await allowed_ids():
             await self.inline.form(
                 self.strings["no_beta"],
                 message=message,
