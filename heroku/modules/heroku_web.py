@@ -134,7 +134,7 @@ class HerokuWebMod(loader.Module):
                     {"text": "TON", "copy": "motherdie.t.me"}
                 ],
                 [
-                    {"text": "TBank / Tinkoff", "url": "https://www.tinkoff.ru/rm/r_PNKEhVmfYI.PFaAZELlol/GzTqT12970"}
+                    {"text": "TBank / Tinkoff", "url": "https://www.tbank.ru/rm/r_PNKEhVmfYI.PFaAZELlol/GzTqT12970"}
                 ],
                 [
                     {"text": "VTB Bank", "url": "https://vtb.paymo.ru/collect-money/qr/?transaction=1531ffd8-8d8e-4d37-abd9-71e59d1399fc"}
