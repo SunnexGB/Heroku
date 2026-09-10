@@ -1183,7 +1183,7 @@ class Heroku:
         self.loop.set_exception_handler(self._loop_exception_handler)
         
         await asyncio.gather(
-            *[self.amain_wrapper(client, await get_allowed_ids) for client in self.clients]
+            *[self.amain_wrapper(client, await get_allowed_ids()) for client in self.clients]
         )
 
     async def _shutdown_handler(self):
