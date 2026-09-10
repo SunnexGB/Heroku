@@ -82,8 +82,8 @@ class HerokuWebMod(loader.Module):
                 self.strings["no_beta"],
                 message=message,
                 reply_markup=[
-                    {"text": "Приобрести", "callback": self.donate},
-                    {"text": "Закрыть", "action": "close"},
+                    {"text": self.strings["get_beta"], "callback": self.donate},
+                    {"text": self.strings["close_addacc"], "action": "close"},
                 ],
             )
             return
@@ -129,6 +129,9 @@ class HerokuWebMod(loader.Module):
             reply_markup=[
                 [
                     {"text": "CryptoBot", "url": "http://t.me/send?start=IVzbov2MTsEt"}
+                ],
+                [
+                    {"text": "TON", "copy": "motherdie.t.me"}
                 ],
                 [
                     {"text": "TBank / Tinkoff", "url": "https://www.tinkoff.ru/rm/r_PNKEhVmfYI.PFaAZELlol/GzTqT12970"}
